@@ -83,7 +83,7 @@ def forward(model, x):
                 if kind == "IDetect":
                     h = h * to_np(children(m.im)[j].implicit)[0]
                 y.append(h)
-        elif kind == "SPPCSPC": # waleed
+        elif kind == "SPPCSPC":
             layers = children_items(m)
 
             c = layers['cv1'].conv
@@ -168,7 +168,7 @@ def forward(model, x):
                 y = y * to_np(bn.weight)[:, None, None] + to_np(bn.bias)[:, None, None]
             y = act(y, m.act)
 
-        elif kind == "RepConv": # waleed
+        elif kind == "RepConv":
             layers = children_items(m)
 
             c = layers['rbr_dense']._modules['0']

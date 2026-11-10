@@ -1,12 +1,13 @@
-# yolov7-tiny on ggml
+# yolov7 on ggml
 
-Object detection with YOLOv7-tiny using [ggml](https://github.com/ggml-org/ggml) as the inference engine. It runs on CPU, or on CUDA, Metal or Vulkan with the usual ggml build flags.
+Object detection with YOLOv7 using [ggml](https://github.com/ggml-org/ggml) as the inference engine. It runs on CPU, or on CUDA, Metal or Vulkan with the usual ggml build flags.
 
 | File | Purpose |
 |---|---|
 | `convert_yolov7_to_gguf.py` | `.pt` checkpoint → `.gguf` (folds BN, fuses IDetect, stores topology as metadata) |
 | `yolov7.cpp` | ggml inference: load GGUF, letterbox, graph, decode, NMS, draw boxes |
 | `verify.py` | Compares ggml outputs to a numpy re-implementation of the PyTorch forward pass |
+| `inspect.py` | This checks input and output shpaes of layers and lets you know if there is any discrepancy |
 | `CMakeLists.txt` | Builds against a local ggml (`-DGGML_DIR=...`) or fetches it automatically |
 
 ## 1. Convert the weights
@@ -72,5 +73,4 @@ Tensors use ggml's `[W, H, C, N]` layout, which is the same memory layout as PyT
 ## Limits
 
 * Batch size 1, square input (multiple of 32).
-* Full YOLOv7 / -X / -W6 need RepConv (reparameterize first) and SPPCSPC, which the converter rejects with a clear message. Adding them is the same pattern as the existing layers.
 * Labels are printed to stdout; boxes are drawn without text.

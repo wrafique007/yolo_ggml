@@ -16,9 +16,9 @@ Pass --torch to load with torch.load() instead (then the yolov7 repo must be
 importable, e.g. PYTHONPATH=/path/to/yolov7).
 
 Supported layers: Conv (+BN, LeakyReLU/SiLU/ReLU/none), Concat, MP, SP,
-nn.MaxPool2d, nn.Upsample (nearest, integer scale), Detect, IDetect,
-RepConv (fused into one 3x3 conv) and SPPCSPC (written as its primitive
-conv / maxpool / concat steps). That covers yolov7-tiny and yolov7.
+nn.MaxPool2d, nn.Upsample (nearest, integer scale), Detect, IDetect.
+That covers yolov7-tiny. Full YOLOv7 additionally needs RepConv and SPPCSPC
+and is rejected with a clear error.
 
 Usage
   pip install numpy gguf
@@ -223,136 +223,55 @@ def resolve_from(f, i):
     # negative = relative to this layer; -1 for layer 0 means the network input (kept as -1)
     return [(i + x if x < 0 else x) for x in fs]
 
-
-def fold_repconv(m):
-    """RepConv (training form: 3x3+BN, 1x1+BN, optional identity BN) -> one 3x3 conv.
-    Same math as RepConv.get_equivalent_kernel_bias() in yolov7/models/common.py."""
-    if "rbr_reparam" in m._modules:                       # already reparameterized (deploy=True)
-        c = m.rbr_reparam
-        k, s, p = conv_geometry(c)
-        w, b = fold_conv_bn(c, None)
-        return w, b, k, s, p
-    dense_conv, dense_bn = children(m.rbr_dense)
-    one_conv, one_bn = children(m.rbr_1x1)
-    k, s, p = conv_geometry(dense_conv)
-    if k != 3 or as_int(one_conv.kernel_size) != 1:
-        raise ValueError("RepConv: expected a 3x3 dense branch and a 1x1 branch")
-    w3, b3 = fold_conv_bn(dense_conv, dense_bn)
-    w1, b1 = fold_conv_bn(one_conv, one_bn)
-    w = w3 + np.pad(w1, ((0, 0), (0, 0), (1, 1), (1, 1)))  # _pad_1x1_to_3x3_tensor
-    b = b3 + b1
-    idn = m._modules.get("rbr_identity")
-    if idn is not None:                                   # identity = 3x3 kernel with 1 at the centre
-        c = w.shape[0]
-        wid = np.zeros_like(w)
-        wid[np.arange(c), np.arange(c), 1, 1] = 1.0
-        scale = to_np(idn.weight) / np.sqrt(to_np(idn.running_var) + float(idn.eps))
-        w = w + wid * scale[:, None, None, None]
-        b = b + to_np(idn.bias) - to_np(idn.running_mean) * scale
-    return w.astype(np.float32), b.astype(np.float32), k, s, p
+def resolve_from_concat(f, i, count, start):
+    fs = f if isinstance(f, (list, tuple)) else [f]
+    # negative = relative to this layer; -1 for layer 0 means the network input (kept as -1)
+    return [(i + x if x < 0 else x if x < start else x+count) for x in fs]
 
 
-def pool_geometry(pool):
-    if getattr(pool, "ceil_mode", False):
-        raise ValueError("ceil_mode pooling is not supported")
-    return as_int(pool.kernel_size), as_int(pool.stride), as_int(pool.padding)
-
-
-class GraphWriter:
-    """Builds the flat layer list stored in GGUF metadata.
-
-    Every entry is one primitive the engine knows (conv / maxpool / concat / upsample / detect).
-    A composite PyTorch module such as SPPCSPC is written as several entries, so its internal
-    torch.cat calls become ordinary 'concat' entries. Because of that, the flat index of a layer
-    can differ from its index in model.model; out_idx maps model.model index -> flat index of
-    that module's output, and every 'from' is translated through it."""
-
-    def __init__(self):
-        self.layers, self.tensors, self.out_idx = [], {}, []
-
-    def _add(self, desc):
-        self.layers.append(desc)
-        return len(self.layers) - 1
-
-    @staticmethod
-    def _fr(srcs):
-        return ",".join(str(s) for s in srcs)
-
-    def conv(self, src, w, b, k, s, p, act):
-        i = len(self.layers)
-        self.tensors[f"l{i}.weight"], self.tensors[f"l{i}.bias"] = w, b
-        return self._add(f"conv from={src} k={k} s={s} p={p} act={act}")
-
-    def conv_module(self, src, m):                        # yolov7 Conv = Conv2d + BN + act
-        k, s, p = conv_geometry(m.conv)
-        w, b = fold_conv_bn(m.conv, m.bn if "bn" in m._modules else None)
-        return self.conv(src, w, b, k, s, p, activation(m.act))
-
-    def maxpool(self, src, pool):
-        k, s, p = pool_geometry(pool)
-        return self._add(f"maxpool from={src} k={k} s={s} p={p}")
-
-    def concat(self, srcs):                               # torch.cat(srcs, dim=1)
-        return self._add(f"concat from={self._fr(srcs)}")
-
-    def add(self, srcs, act="none"):                      # act(srcs[0] + srcs[1] + ...)
-        if len(srcs) < 2:
-            raise ValueError("add needs at least two inputs")
-        return self._add(f"add from={self._fr(srcs)} act={act}")
-
-    def sppcspc(self, x, m):
-        # x1 = self.cv4(self.cv3(self.cv1(x)))
-        x1 = self.conv_module(self.conv_module(self.conv_module(x, m.cv1), m.cv3), m.cv4)
-        # torch.cat([x1] + [m(x1) for m in self.m], 1)
-        pools = [self.maxpool(x1, pool) for pool in children(m.m)]
-        cat1 = self.concat([x1] + pools)
-        # y1 = self.cv6(self.cv5(cat1))
-        y1 = self.conv_module(self.conv_module(cat1, m.cv5), m.cv6)
-        # y2 = self.cv2(x)
-        y2 = self.conv_module(x, m.cv2)
-        # self.cv7(torch.cat((y1, y2), dim=1))
-        return self.conv_module(self.concat([y1, y2]), m.cv7)
-
-
-def convert(model, ftype, graph_decode=False):
-    gw = GraphWriter()
-    tensors = gw.tensors
+def convert(model, ftype):
+    layers, tensors = [], {}
     mods = children(model.model)
+
     detect = None
 
+    count = 0
+    start = 0
+    repconv_count = 0
     for i, m in enumerate(mods):
         kind = type(m).__name__
-        # model.model indices -> flat indices (-1 = network input)
-        src = [gw.out_idx[j] if j >= 0 else -1 for j in resolve_from(m.f, i)]
-        fr = gw._fr(src)
+        if kind == "Concat":
+            src = resolve_from_concat(m.f, i+count, count, start)
+        elif kind == "Detect" or kind == "IDetect":
+            src = [115, 118, 121]
+        else:
+            src = resolve_from(m.f, i+count)
+        fr = ",".join(str(x) for x in src)
+
 
         if kind == "Conv":
-            gw.out_idx.append(gw.conv_module(src[0], m))
-            continue
+            k, s, p = conv_geometry(m.conv)
+            w, b = fold_conv_bn(m.conv, getattr(m, "bn", None) if "bn" in m._modules else None)
+            if (int(fr) < start):
+                tensors[f"l{i+count}.weight"], tensors[f"l{i+count}.bias"] = w, b
+                layers.append(f"conv from={fr} k={k} s={s} p={p} act={activation(m.act)}")
+            else:
+                tensors[f"l{i+count}.weight"], tensors[f"l{i+count}.bias"] = w, b
+                layers.append(f"conv from={fr} k={k} s={s} p={p} act={activation(m.act)}")
 
-        if kind == "RepConv":
-            w, b, k, s, p = fold_repconv(m)
-            gw.out_idx.append(gw.conv(src[0], w, b, k, s, p, activation(m.act)))
-            continue
-
-        if kind == "SPPCSPC":
-            gw.out_idx.append(gw.sppcspc(src[0], m))
-            continue
-
-        if kind == "Concat":
+        elif kind == "Concat":
             if int(m.d) != 1:
                 raise ValueError(f"layer {i}: Concat on dim {m.d} is not supported")
-            gw.out_idx.append(gw.concat(src))
-            continue
+            layers.append(f"concat from={fr}")
 
-        if kind in ("MP", "SP", "MaxPool2d"):
-            gw.out_idx.append(gw.maxpool(src[0], m if kind == "MaxPool2d" else m.m))
-            continue
+        elif kind in ("MP", "SP", "MaxPool2d"):
+            pool = m if kind == "MaxPool2d" else m.m
+            k, s, p = as_int(pool.kernel_size), as_int(pool.stride), as_int(pool.padding)
+            if getattr(pool, "ceil_mode", False):
+                raise ValueError(f"layer {i}: ceil_mode pooling is not supported")
+            layers.append(f"maxpool from={fr} k={k} s={s} p={p}")
 
-        gw.out_idx.append(len(gw.layers))                 # the single entry appended below
-        layers = gw.layers
-
-        if kind == "Upsample":
+        elif kind == "Upsample":
             if m.mode != "nearest" or m.scale_factor is None:
                 raise ValueError(f"layer {i}: only nearest Upsample with scale_factor is supported")
             sf = m.scale_factor
@@ -362,6 +281,7 @@ def convert(model, ftype, graph_decode=False):
             layers.append(f"upsample from={fr} scale={int(sf)}")
 
         elif kind in ("Detect", "IDetect"):
+            graph_decode = False
             if i != len(mods) - 1:
                 raise ValueError("Detect must be the last layer")
             detect = m
@@ -382,10 +302,151 @@ def convert(model, ftype, graph_decode=False):
             # view -> permute -> sigmoid -> xy/wh decode -> view(bs,-1,no) -> torch.cat(z, 1)
             layers.append(f"detect from={fr}" + (" decode=1" if graph_decode else ""))
 
-        else:
-            raise ValueError(f"layer {i}: unsupported module type {kind}")
+        elif kind in ("SPPCSPC"):
 
-    layers = gw.layers
+            # cv1, 51
+            start = i
+            cv1 = m._modules["cv1"]
+            k, s, p = conv_geometry(cv1.conv)
+            w, b = fold_conv_bn(cv1.conv, getattr(cv1, "bn", None) if "bn" in cv1._modules else None)
+            tensors[f"l{i+count}.weight"], tensors[f"l{i+count}.bias"] = w, b
+            layers.append(f"conv from={str(int(fr)+count)} k={k} s={s} p={p} act={activation(cv1.act)}")
+            count += 1
+
+            # cv3
+            cv3 = m._modules["cv3"]
+            k, s, p = conv_geometry(cv3.conv)
+            w, b = fold_conv_bn(cv3.conv, getattr(cv3, "bn", None) if "bn" in cv3._modules else None)
+            tensors[f"l{i+count}.weight"], tensors[f"l{i+count}.bias"] = w, b
+            layers.append(f"conv from={str(int(fr)+count)} k={k} s={s} p={p} act={activation(cv3.act)}")
+            count += 1
+
+            # cv4
+            cv4 = m._modules["cv4"]
+            k, s, p = conv_geometry(cv4.conv)
+            w, b = fold_conv_bn(cv4.conv, getattr(cv4, "bn", None) if "bn" in cv4._modules else None)
+            tensors[f"l{i+count}.weight"], tensors[f"l{i+count}.bias"] = w, b
+            layers.append(f"conv from={str(int(fr)+count)} k={k} s={s} p={p} act={activation(cv4.act)}")
+            count += 1
+            cv4_count = count
+
+            # MaxPool2d Module List, name of the ModuleList is m
+            # ModuleList[0]
+            pool = m._modules["m"]._modules["0"]
+            k, s, p = as_int(pool.kernel_size), as_int(pool.stride), as_int(pool.padding)
+            if getattr(pool, "ceil_mode", False):
+                raise ValueError(f"layer {i}: ceil_mode pooling is not supported")
+            layers.append(f"maxpool from={str(int(fr)+cv4_count)} k={k} s={s} p={p}")
+            count += 1
+
+            # MaxPool2d Module List, name of the ModuleList is m
+            # ModuleList[1]
+            pool = m._modules["m"]._modules["1"]
+            k, s, p = as_int(pool.kernel_size), as_int(pool.stride), as_int(pool.padding)
+            if getattr(pool, "ceil_mode", False):
+                raise ValueError(f"layer {i}: ceil_mode pooling is not supported")
+            layers.append(f"maxpool from={str(int(fr)+cv4_count)} k={k} s={s} p={p}")
+            count += 1
+
+            # MaxPool2d Module List, name of the ModuleList is m
+            # ModuleList[2]
+            pool = m._modules["m"]._modules["2"]
+            k, s, p = as_int(pool.kernel_size), as_int(pool.stride), as_int(pool.padding)
+            if getattr(pool, "ceil_mode", False):
+                raise ValueError(f"layer {i}: ceil_mode pooling is not supported")
+            layers.append(f"maxpool from={str(int(fr)+cv4_count)} k={k} s={s} p={p}")
+            count += 1
+
+            # Concat
+            fr_of_concat = "53,54,55,56" # This would only work for yolov7. Thus make it generic
+            layers.append(f"concat from={fr_of_concat}")
+            count += 1
+
+            # cv5, 58
+            cv5 = m._modules["cv5"]
+            k, s, p = conv_geometry(cv5.conv)
+            w, b = fold_conv_bn(cv5.conv, getattr(cv5, "bn", None) if "bn" in cv5._modules else None)
+            tensors[f"l{i+count}.weight"], tensors[f"l{i+count}.bias"] = w, b
+            layers.append(f"conv from={str(int(fr)+count)} k={k} s={s} p={p} act={activation(cv5.act)}")
+            count += 1
+
+            # cv6, 59
+            cv6 = m._modules["cv6"]
+            k, s, p = conv_geometry(cv6.conv)
+            w, b = fold_conv_bn(cv6.conv, getattr(cv6, "bn", None) if "bn" in cv6._modules else None)
+            tensors[f"l{i+count}.weight"], tensors[f"l{i+count}.bias"] = w, b
+            layers.append(f"conv from={str(int(fr)+count)} k={k} s={s} p={p} act={activation(cv6.act)}")
+            count += 1
+
+            # cv2
+            cv2 = m._modules["cv2"]
+            k, s, p = conv_geometry(cv2.conv)
+            w, b = fold_conv_bn(cv2.conv, getattr(cv2, "bn", None) if "bn" in cv2._modules else None)
+            tensors[f"l{i+count}.weight"], tensors[f"l{i+count}.bias"] = w, b
+            layers.append(f"conv from={fr} k={k} s={s} p={p} act={activation(cv2.act)}")
+            count += 1
+
+            # Concat, 61
+            fr_of_concat = "59,60" # This would only work for yolov7. Thus make it generic
+            layers.append(f"concat from={fr_of_concat}")
+            count += 1
+
+            # cv7, 62
+            cv7 = m._modules["cv7"]
+            k, s, p = conv_geometry(cv7.conv)
+            w, b = fold_conv_bn(cv7.conv, getattr(cv7, "bn", None) if "bn" in cv7._modules else None)
+            tensors[f"l{i+count}.weight"], tensors[f"l{i+count}.bias"] = w, b
+            layers.append(f"conv from={str(int(fr)+count)} k={k} s={s} p={p} act={activation(cv7.act)}")
+
+
+        elif kind in ("RepConv"):
+
+            # This is RepConv for yolov7 self.act(self.rbr_dense(inputs) + self.rbr_1x1(inputs))
+            num_of_layers = len(layers)
+
+            # Make this generic as this would only work for Yolov7
+            if repconv_count == 0:
+                deduct_count = 0
+            elif repconv_count == 1:
+                deduct_count = 2
+            elif repconv_count == 2:
+                deduct_count = 4
+            else:
+                raise ValueError("RepConv cannot be more than 3 as yolov7 only have " \
+                "3 RepConv layers")
+
+            # rbr_dense is a Sequential List
+            rbr_dense = m._modules["rbr_dense"]._modules
+            k, s, p = conv_geometry(rbr_dense["0"])
+            w, b = fold_conv_bn(rbr_dense['0'], rbr_dense['1'])
+            tensors[f"l{i+count}.weight"], tensors[f"l{i+count}.bias"] = w, b
+            layers.append(f"conv from={str(int(fr)+count-deduct_count)} k={k} s={s} p={p}")
+            count += 1
+
+            # rbr_1x1 is a Sequential List
+            rbr_1x1 = m._modules["rbr_1x1"]._modules
+            k, s, p = conv_geometry(rbr_1x1["0"])
+            w, b = fold_conv_bn(rbr_1x1['0'], rbr_1x1['1'])
+            # In case of rbr_1x1, its input is also the input of rbr_dense, hence we need to reduce the "from" by 1 to point
+            # to the input of rbr_dense
+            tensors[f"l{i+count}.weight"], tensors[f"l{i+count}.bias"] = w, b
+            layers.append(f"conv from={str(int(fr)+count-deduct_count-1)} k={k} s={s} p={p}")
+            count += 1
+
+            # Add
+            fr_of_add = str(num_of_layers) + "," + str(num_of_layers+1)  # This would only work for yolov7. Thus make it generic
+            layers.append(f"add from={fr_of_add} act={activation(m._modules['act'])}")
+
+            repconv_count += 1
+
+
+        elif kind in ("ReOrg", "DownC", "SPPF", "Bottleneck", "C3"):
+            raise ValueError(f"layer {i}: {kind} is used by the larger YOLOv7 variants and is not "
+                             "implemented in this converter/engine yet (yolov7-tiny does not use it)")
+        else:
+            string = f"layer {i}: unsupported module type {kind}"
+            raise ValueError(string)
+
     if detect is None:
         raise ValueError("no Detect/IDetect layer found")
 
@@ -396,12 +457,6 @@ def convert(model, ftype, graph_decode=False):
         anchors = to_np(detect.anchor_grid).reshape(nl, na, 2)          # pixels
     else:
         anchors = to_np(detect.anchors).reshape(nl, na, 2) * np.array(strides)[:, None, None]
-
-    if graph_decode:
-        # anchor_grid in PyTorch is (1, na, 1, 1, 2) per level; stored as numpy (na, 1, 1, 2)
-        # = ggml [2, 1, 1, na], which broadcasts over the [no, nx, ny, na] head tensor.
-        for j in range(nl):
-            tensors[f"det{j}.anchor_grid"] = anchors[j].reshape(na, 1, 1, 2).astype(np.float32)
 
     names = getattr(model, "names", None) or [f"class{c}" for c in range(nc)]
     meta = dict(nl=nl, na=na, nc=nc, strides=strides, anchors=anchors, names=list(names))
@@ -420,10 +475,10 @@ def write_gguf(path, layers, tensors, meta, ftype, name):
     w.add_array("yolov7.layers", layers)
 
     for tname, arr in tensors.items():
-        if tname.endswith(".weight") and arr.ndim == 4 and ftype == "f16":
+        if arr.ndim == 4 and ftype == "f16":
             arr = arr.astype(np.float16)
         else:
-            arr = arr.astype(np.float32)        # biases and anchors always f32
+            arr = arr.astype(np.float32)        # biases always f32
         w.add_tensor(tname, np.ascontiguousarray(arr))
 
     w.write_header_to_file()
@@ -438,15 +493,12 @@ def main():
     ap.add_argument("output", help="output .gguf")
     ap.add_argument("--type", choices=["f32", "f16"], default="f16", help="conv weight type (default f16)")
     ap.add_argument("--torch", action="store_true", help="load with torch.load (needs yolov7 repo on PYTHONPATH)")
-    ap.add_argument("--graph-decode", action="store_true",
-                    help="do Detect's sigmoid/decode/torch.cat inside the ggml graph "
-                         "(output [1, N, 5+nc] like the PyTorch model) instead of in C++ after it")
     args = ap.parse_args()
 
     ckpt = load_checkpoint_torch(args.checkpoint) if args.torch else load_checkpoint_numpy(args.checkpoint)
     model = ckpt.get("ema") or ckpt["model"] if isinstance(ckpt, dict) else ckpt
 
-    layers, tensors, meta = convert(model, args.type, args.graph_decode)
+    layers, tensors, meta = convert(model, args.type)
     name = args.checkpoint.rsplit("/", 1)[-1].rsplit(".", 1)[0]
     write_gguf(args.output, layers, tensors, meta, args.type, name)
 
