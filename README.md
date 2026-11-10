@@ -15,12 +15,18 @@ Object detection with YOLOv7 using [ggml](https://github.com/ggml-org/ggml) as t
 ```bash
 pip install numpy gguf
 wget https://github.com/WongKinYiu/yolov7/releases/download/v0.1/yolov7-tiny.pt
+wget https://github.com/WongKinYiu/yolov7/releases/download/v0.1/yolov7.pt
+wget https://github.com/WongKinYiu/yolov7/releases/download/v0.1/yolov7x.pt
+
+
 python convert_yolov7_to_gguf.py yolov7-tiny.pt yolov7-tiny-f32.gguf --type f32
 python convert_yolov7_to_gguf.py yolov7-tiny.pt yolov7-tiny-f16.gguf --type f16
 
 python convert_yolov7_to_gguf.py yolov7.pt yolov7-f32.gguf --type f32
+python convert_yolov7_to_gguf.py yolov7.pt yolov7-f16.gguf --type f16
 
-python inspect_gguf.py yolov7-f32.gguf
+python convert_yolov7_to_gguf.py yolov7x.pt yolov7x-f32.gguf --type f32
+python convert_yolov7_to_gguf.py yolov7x.pt yolov7x-f16.gguf --type f16
 ```
 
 You don't need torch or the yolov7 repo; the checkpoint is read directly. Your own fine-tuned yolov7-tiny checkpoints work the same way, and class names come from the checkpoint.
@@ -43,6 +49,8 @@ cmake --build build -j
 ./build/yolov7 -m yolov7-tiny-f32.gguf -i horses.jpg -s 416 -t 8   # smaller input, 8 threads
 
 ./build/yolov7 -m yolov7-f32.gguf -i horses.jpg -o out.jpg
+
+./build/yolov7 -m yolov7x-f32.gguf -i horses.jpg -o out.jpg
 ```
 
 Options: `--conf 0.25`, `--iou 0.45`, `--bench N`, `--dump DIR`.
@@ -55,6 +63,12 @@ python verify.py yolov7-tiny.pt dump
 
 ./build/yolov7 -m yolov7-f32.gguf -i horses.jpg --dump dump
 python verify.py yolov7.pt dump
+
+./build/yolov7 -m yolov7x-f32.gguf -i horses.jpg --dump dump
+python verify.py yolov7x.pt dump
+
+python inspect_gguf.py yolov7-f32.gguf
+python inspect_gguf.py yolov7x-f32.gguf
 ```
 
 ## How it maps onto ggml

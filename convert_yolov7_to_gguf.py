@@ -33,6 +33,8 @@ import zipfile
 
 import numpy as np
 
+from enum import Enum
+
 try:
     import gguf
 except ImportError:
@@ -51,6 +53,11 @@ _STORAGE_DTYPES = {
     "BFloat16Storage": "bf16",
 }
 
+
+class MODEL_NAMES(str, Enum):
+    V7 ='v7'
+    V7X ='v7x'
+    V7_TINY = 'v7-tiny'
 
 class _StorageType:
     def __init__(self, dtype):
@@ -228,24 +235,32 @@ def resolve_from_concat(f, i, count, start):
     # negative = relative to this layer; -1 for layer 0 means the network input (kept as -1)
     return [(i + x if x < 0 else x if x < start else x+count) for x in fs]
 
-
-def convert(model, ftype):
+def convert(model, ftype, model_name):
     layers, tensors = [], {}
     mods = children(model.model)
 
     detect = None
 
-    count = 0
-    start = 0
-    repconv_count = 0
+    count = 0 # This variable keeps track of layers which are added by SPPCSPC and RepConv operator
+    start = 0 # This keeps track of the index where SPPCSPC layers was added
+    repconv_count = 0 # This keeps track of how many RepConv layers have been added
     for i, m in enumerate(mods):
         kind = type(m).__name__
+
         if kind == "Concat":
             src = resolve_from_concat(m.f, i+count, count, start)
+
         elif kind == "Detect" or kind == "IDetect":
-            src = [115, 118, 121]
+            if MODEL_NAMES.V7.value == model_name:
+                src = [115, 118, 121]
+            elif MODEL_NAMES.V7X.value == model_name:
+                src = [129, 130, 131]
+            elif MODEL_NAMES.V7_TINY.value == model_name:
+                raise ValueError("Add detection head for tiny model")
+
         else:
-            src = resolve_from(m.f, i+count)
+            src = resolve_from_concat(m.f, i+count, count, start)
+
         fr = ",".join(str(x) for x in src)
 
 
@@ -304,6 +319,13 @@ def convert(model, ftype):
 
         elif kind in ("SPPCSPC"):
 
+            # Here is the forward function of SPPCSPC node:
+            # All self.cvn (n represents layer number e.g 1,2,3..) are convolution layers
+            # x1 = self.cv4(self.cv3(self.cv1(x)))
+            # y1 = self.cv6(self.cv5(torch.cat([x1] + [m(x1) for m in self.m], 1)))
+            # y2 = self.cv2(x)
+            # return self.cv7(torch.cat((y1, y2), dim=1))
+
             # cv1, 51
             start = i
             cv1 = m._modules["cv1"]
@@ -321,7 +343,7 @@ def convert(model, ftype):
             layers.append(f"conv from={str(int(fr)+count)} k={k} s={s} p={p} act={activation(cv3.act)}")
             count += 1
 
-            # cv4
+            # cv4, 53
             cv4 = m._modules["cv4"]
             k, s, p = conv_geometry(cv4.conv)
             w, b = fold_conv_bn(cv4.conv, getattr(cv4, "bn", None) if "bn" in cv4._modules else None)
@@ -358,7 +380,8 @@ def convert(model, ftype):
             count += 1
 
             # Concat
-            fr_of_concat = "53,54,55,56" # This would only work for yolov7. Thus make it generic
+            # Below code is building concat operation from following part of SPPCSPC: y1 = self.cv6(self.cv5(torch.cat([x1] + [m(x1) for m in self.m], 1)))
+            fr_of_concat = str(int(fr)+count-3) + "," + str(int(fr)+count-2) + "," + str(int(fr)+count-1) + "," + str(int(fr)+count) # fr_of_concat = "53,54,55,56" for yolov7
             layers.append(f"concat from={fr_of_concat}")
             count += 1
 
@@ -387,7 +410,7 @@ def convert(model, ftype):
             count += 1
 
             # Concat, 61
-            fr_of_concat = "59,60" # This would only work for yolov7. Thus make it generic
+            fr_of_concat = str(int(fr)+count-1) + "," + str(int(fr)+count) # fr_of_concat = "59,60" for yolov7
             layers.append(f"concat from={fr_of_concat}")
             count += 1
 
@@ -397,6 +420,7 @@ def convert(model, ftype):
             w, b = fold_conv_bn(cv7.conv, getattr(cv7, "bn", None) if "bn" in cv7._modules else None)
             tensors[f"l{i+count}.weight"], tensors[f"l{i+count}.bias"] = w, b
             layers.append(f"conv from={str(int(fr)+count)} k={k} s={s} p={p} act={activation(cv7.act)}")
+            # Don't need to increment "count" for this layer because "i" will be incremented by the for loop and we are adding "count" to "i"
 
 
         elif kind in ("RepConv"):
@@ -404,7 +428,6 @@ def convert(model, ftype):
             # This is RepConv for yolov7 self.act(self.rbr_dense(inputs) + self.rbr_1x1(inputs))
             num_of_layers = len(layers)
 
-            # Make this generic as this would only work for Yolov7
             if repconv_count == 0:
                 deduct_count = 0
             elif repconv_count == 1:
@@ -420,7 +443,7 @@ def convert(model, ftype):
             k, s, p = conv_geometry(rbr_dense["0"])
             w, b = fold_conv_bn(rbr_dense['0'], rbr_dense['1'])
             tensors[f"l{i+count}.weight"], tensors[f"l{i+count}.bias"] = w, b
-            layers.append(f"conv from={str(int(fr)+count-deduct_count)} k={k} s={s} p={p}")
+            layers.append(f"conv from={str(int(fr)-deduct_count)} k={k} s={s} p={p}")
             count += 1
 
             # rbr_1x1 is a Sequential List
@@ -430,12 +453,13 @@ def convert(model, ftype):
             # In case of rbr_1x1, its input is also the input of rbr_dense, hence we need to reduce the "from" by 1 to point
             # to the input of rbr_dense
             tensors[f"l{i+count}.weight"], tensors[f"l{i+count}.bias"] = w, b
-            layers.append(f"conv from={str(int(fr)+count-deduct_count-1)} k={k} s={s} p={p}")
+            layers.append(f"conv from={str(int(fr)-deduct_count)} k={k} s={s} p={p}")
             count += 1
 
             # Add
-            fr_of_add = str(num_of_layers) + "," + str(num_of_layers+1)  # This would only work for yolov7. Thus make it generic
+            fr_of_add = str(num_of_layers) + "," + str(num_of_layers+1)
             layers.append(f"add from={fr_of_add} act={activation(m._modules['act'])}")
+            # Don't need to increment "count" for this layer because "i" will be incremented by the for loop and we are adding "count" to "i"
 
             repconv_count += 1
 
@@ -486,10 +510,28 @@ def write_gguf(path, layers, tensors, meta, ftype, name):
     w.write_tensors_to_file()
     w.close()
 
+def check_model_name(name):
+
+    if "." in name:
+        parts = name.split(".")
+        lower_case_name = parts[0].lower()
+
+        if MODEL_NAMES.V7X in lower_case_name:
+            return MODEL_NAMES.V7X.value
+        elif MODEL_NAMES.V7 in lower_case_name:
+            return MODEL_NAMES.V7.value
+        elif MODEL_NAMES.V7_TINY in lower_case_name:
+            MODEL_NAMES.V7_TINY.value
+        else:
+            output = f"Could not determine model name from {name}"
+            raise ValueError(output)
+    else:
+        output = f"Could not determine model name from {name}"
+        raise ValueError(output)
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("checkpoint", help="yolov7-tiny.pt")
+    ap.add_argument("checkpoint", help="yolov7.pt")
     ap.add_argument("output", help="output .gguf")
     ap.add_argument("--type", choices=["f32", "f16"], default="f16", help="conv weight type (default f16)")
     ap.add_argument("--torch", action="store_true", help="load with torch.load (needs yolov7 repo on PYTHONPATH)")
@@ -498,7 +540,8 @@ def main():
     ckpt = load_checkpoint_torch(args.checkpoint) if args.torch else load_checkpoint_numpy(args.checkpoint)
     model = ckpt.get("ema") or ckpt["model"] if isinstance(ckpt, dict) else ckpt
 
-    layers, tensors, meta = convert(model, args.type)
+    model_name = check_model_name(args.checkpoint)
+    layers, tensors, meta = convert(model, args.type, model_name)
     name = args.checkpoint.rsplit("/", 1)[-1].rsplit(".", 1)[0]
     write_gguf(args.output, layers, tensors, meta, args.type, name)
 
