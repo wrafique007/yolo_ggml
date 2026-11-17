@@ -534,7 +534,6 @@ static void build_graph(yolo_graph & G, const yolo_model & model, int width, int
     G.gf  = ggml_new_graph_custom(G.ctx, GRAPH_SIZE, false);
     ggml_context * ctx = G.ctx;
 
-    std:: printf("\n\nwidth=%d height=%d\n\n", width, height); // waleed
     G.input = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, width, height, 3, 1);   // [W, H, C, N], planar RGB
     ggml_set_name(G.input, "input");
     ggml_set_input(G.input);
