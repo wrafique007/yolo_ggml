@@ -1,6 +1,6 @@
-// YOLOv7(-tiny) object detection with ggml as the inference engine.
+// YOLOv7 object detection with ggml as the inference engine.
 //
-//   ./yolov7 -m yolov7-tiny-f16.gguf -i image.jpg -o out.jpg
+//   ./yolov7 -m yolov7-f16.gguf -i image.jpg -o out.jpg
 //
 // The network topology is read from the GGUF metadata written by
 // convert_yolov7_to_gguf.py, so this file contains no hard-coded layer list.
