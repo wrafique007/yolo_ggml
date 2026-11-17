@@ -24,6 +24,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -34,10 +35,22 @@
 // model
 // ---------------------------------------------------------------------------
 
+// Activation layout.
+//   false (default): ggml [W, H, C, N] -- same memory order as PyTorch NCHW
+//   true  (--nhwc):  ggml [C, W, H, N] -- channels contiguous, like PyTorch channels_last.
+//                    1x1 convs then need no im2col at all, and KxK convs build their
+//                    patch matrix from contiguous runs of C floats (see conv2d_nhwc).
+static bool g_nhwc = false;
+static int64_t dim_c(const ggml_tensor * t) { return g_nhwc ? t->ne[0] : t->ne[2]; }
+static int64_t dim_w(const ggml_tensor * t) { return g_nhwc ? t->ne[1] : t->ne[0]; }
+static int64_t dim_h(const ggml_tensor * t) { return g_nhwc ? t->ne[2] : t->ne[1]; }
+static constexpr size_t GRAPH_SIZE = 16384;
+
 enum class layer_type { conv, concat, maxpool, upsample, add, detect };
 enum class act_type   { none, leaky, silu, relu };
 
 struct yolo_layer {
+    std::string      desc;          // the original metadata string, for error messages
     layer_type       type;
     std::vector<int> from;          // absolute layer indices, -1 = network input
     int k = 1, s = 1, p = 0;        // conv / pool geometry
@@ -60,6 +73,7 @@ struct yolo_model {
 
     ggml_backend_t        backend     = nullptr;   // weights live here
     ggml_backend_t        backend_cpu = nullptr;   // fallback for unsupported ops
+    std::vector<ggml_backend_t> backend_acc;       // BLAS / accelerator backends, if any
     ggml_context        * ctx_w       = nullptr;
     ggml_backend_buffer_t buf_w       = nullptr;
     ggml_backend_sched_t  sched       = nullptr;
@@ -69,6 +83,7 @@ struct yolo_model {
         if (buf_w)       ggml_backend_buffer_free(buf_w);
         if (ctx_w)       ggml_free(ctx_w);
         if (backend_cpu && backend_cpu != backend) ggml_backend_free(backend_cpu);
+        for (auto b : backend_acc) ggml_backend_free(b);
         if (backend)     ggml_backend_free(backend);
     }
 };
@@ -87,6 +102,7 @@ static yolo_layer parse_layer(const std::string & desc) {
     std::string kind, kv;
     ss >> kind;
     yolo_layer L;
+    L.desc = desc;
     if      (kind == "conv")     L.type = layer_type::conv;
     else if (kind == "concat")   L.type = layer_type::concat;
     else if (kind == "maxpool")  L.type = layer_type::maxpool;
@@ -161,7 +177,17 @@ static ggml_backend_t init_backend(bool use_gpu, int n_threads) {
     return backend;
 }
 
-static void load_model(yolo_model & model, const char * path, bool use_gpu, int n_threads) {
+// conv weights with a KxK kernel (K > 1) are reordered at load time in NHWC mode
+static bool needs_nhwc_permute(const yolo_model & model, const char * name, const ggml_tensor * t) {
+    if (!g_nhwc || name[0] != 'l') return false;
+    const std::string nm(name);
+    const auto dot = nm.find(".weight");
+    if (dot == std::string::npos || dot + 7 != nm.size()) return false;
+    const size_t i = std::stoul(nm.substr(1, dot - 1));
+    return i < model.layers.size() && model.layers[i].type == layer_type::conv && t->ne[0] * t->ne[1] > 1;
+}
+
+static void load_model(yolo_model & model, const char * path, bool use_gpu, bool use_blas, int n_threads) {
     ggml_context * meta = nullptr;
     gguf_init_params gp = { /*no_alloc*/ true, &meta };
     gguf_context * g = gguf_init_from_file(path, gp);
@@ -189,7 +215,9 @@ static void load_model(yolo_model & model, const char * path, bool use_gpu, int 
     for (int64_t i = 0; i < n_tensors; i++) {
         const char  * name = gguf_get_tensor_name(g, i);
         ggml_tensor * src  = ggml_get_tensor(meta, name);
-        ggml_tensor * dst  = ggml_dup_tensor(model.ctx_w, src);
+        ggml_tensor * dst  = needs_nhwc_permute(model, name, src)
+            ? ggml_new_tensor_4d(model.ctx_w, src->type, src->ne[2], src->ne[0], src->ne[1], src->ne[3])
+            : ggml_dup_tensor(model.ctx_w, src);
         ggml_set_name(dst, name);
     }
     model.buf_w = ggml_backend_alloc_ctx_tensors(model.ctx_w, model.backend);
@@ -207,6 +235,19 @@ static void load_model(yolo_model & model, const char * path, bool use_gpu, int 
             std::fclose(f);
             throw std::runtime_error(std::string("failed to read tensor ") + ggml_get_name(t));
         }
+        if (needs_nhwc_permute(model, ggml_get_name(t), t)) {
+            // file order [KW, KH, IC, OC] -> [IC, KW, KH, OC] (t->ne is already the new shape)
+            const int64_t IC = t->ne[0], KW = t->ne[1], KH = t->ne[2], OC = t->ne[3];
+            const size_t  es = ggml_type_size(t->type);
+            std::vector<uint8_t> perm(n);
+            for (int64_t oc = 0; oc < OC; oc++)
+                for (int64_t ic = 0; ic < IC; ic++)
+                    for (int64_t kh = 0; kh < KH; kh++)
+                        for (int64_t kw = 0; kw < KW; kw++)
+                            std::memcpy(&perm[(((oc * KH + kh) * KW + kw) * IC + ic) * es],
+                                        &tmp[(((oc * IC + ic) * KH + kh) * KW + kw) * es], es);
+            tmp.swap(perm);
+        }
         ggml_backend_tensor_set(t, tmp.data(), 0, n);
     }
     std::fclose(f);
@@ -214,10 +255,7 @@ static void load_model(yolo_model & model, const char * path, bool use_gpu, int 
     // --- bind tensors to layers ---
     auto get = [&](const std::string & name) {
         ggml_tensor * t = ggml_get_tensor(model.ctx_w, name.c_str());
-        if (!t)
-        {
-            throw std::runtime_error("missing tensor " + name);
-        }
+        if (!t) throw std::runtime_error("missing tensor " + name);
         return t;
     };
     for (size_t i = 0; i < model.layers.size(); i++) {
@@ -237,18 +275,38 @@ static void load_model(yolo_model & model, const char * path, bool use_gpu, int 
     gguf_free(g);
     ggml_free(meta);
 
-    // --- scheduler: primary backend + CPU fallback for any op the GPU lacks ---
+    // --- scheduler, in priority order: [GPU] -> [BLAS/accelerator] -> CPU ---
+    // The scheduler gives each op to the first backend that supports it. The BLAS backend
+    // (Apple Accelerate on macOS, OpenBLAS/MKL/BLIS elsewhere) only takes large matrix
+    // multiplies -- exactly the conv GEMMs -- and everything else falls through to CPU.
     std::vector<ggml_backend_t> backends = { model.backend };
     ggml_backend_dev_t dev = ggml_backend_get_device(model.backend);
-    if (dev && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+    const bool primary_is_cpu = !dev || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU;
+    if (use_blas) {
+        for (size_t d = 0; d < ggml_backend_dev_count(); d++) {
+            ggml_backend_dev_t acc = ggml_backend_dev_get(d);
+            if (ggml_backend_dev_type(acc) != GGML_BACKEND_DEVICE_TYPE_ACCEL) continue;
+            ggml_backend_t b = ggml_backend_dev_init(acc, nullptr);
+            if (!b) continue;
+            auto set_threads = (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(
+                ggml_backend_dev_backend_reg(acc), "ggml_backend_set_n_threads");
+            if (set_threads) set_threads(b, n_threads);
+            model.backend_acc.push_back(b);
+            // before the CPU backend; after a GPU backend
+            backends.insert(primary_is_cpu ? backends.begin() : backends.end(), b);
+        }
+    }
+    if (!primary_is_cpu) {
         model.backend_cpu = init_backend(false, n_threads);
         backends.push_back(model.backend_cpu);
     }
     model.sched = ggml_backend_sched_new(backends.data(), nullptr, (int) backends.size(),
-                                         GGML_DEFAULT_GRAPH_SIZE, false, true);
+                                         GRAPH_SIZE, false, true);
 
-    std::printf("loaded %s: %zu layers, %d classes, backend: %s\n",
-                path, model.layers.size(), model.nc, ggml_backend_name(model.backend));
+    std::string names;
+    for (auto b : backends) names += std::string(names.empty() ? "" : " + ") + ggml_backend_name(b);
+    std::printf("loaded %s: %zu layers, %d classes, backends: %s\n",
+                path, model.layers.size(), model.nc, names.c_str());
 }
 
 // ---------------------------------------------------------------------------
@@ -257,7 +315,116 @@ static void load_model(yolo_model & model, const char * path, bool use_gpu, int 
 
 // conv2d via im2col + mul_mat. Activations are kept in the weight type
 // (f32 weights -> exact f32 path, f16 weights -> f16 im2col, faster).
+// ---------------------------------------------------------------------------
+// Channels-last helper ops, implemented as ggml custom ops (CPU, all threads).
+// ggml has no NHWC im2col, and its CPU pool_2d runs on a single thread, so these two
+// replace them for the --nhwc path. Each thread handles a contiguous range of output pixels.
+// ---------------------------------------------------------------------------
+
+struct nhwc_op_params { int k, s, p; };
+static std::deque<nhwc_op_params> g_op_params;     // stable addresses for the custom-op userdata
+
+static inline void pixel_range(int64_t n, int ith, int nth, int64_t & i0, int64_t & i1) {
+    const int64_t per = (n + nth - 1) / nth;
+    i0 = std::min(n, per * ith);
+    i1 = std::min(n, i0 + per);
+}
+
+// dst [K*K*C, OW, OH] from x [C, W, H]: for every output pixel, its KxK neighbourhood as
+// (kh, kw, c) with c fastest; outside the image is 0 (zero padding). For one kh, the K
+// horizontal neighbours are adjacent in channels-last memory, so each kh is one memcpy.
+static void op_im2col_nhwc(ggml_tensor * dst, int ith, int nth, void * ud) {
+    const auto & P = *(const nhwc_op_params *) ud;
+    const ggml_tensor * x = dst->src[0];
+    const int64_t C = x->ne[0], W = x->ne[1], H = x->ne[2];
+    const int64_t OW = dst->ne[1], OH = dst->ne[2], K = P.k, KC = K * C;
+    const float * src = (const float *) x->data;
+    float       * out = (float *) dst->data;
+    int64_t i0, i1;
+    pixel_range(OW * OH, ith, nth, i0, i1);
+    for (int64_t i = i0; i < i1; i++) {
+        const int64_t ox = i % OW, oy = i / OW;
+        float * row = out + i * K * KC;
+        for (int64_t kh = 0; kh < K; kh++) {
+            float * seg = row + kh * KC;
+            const int64_t iy = oy * P.s + kh - P.p;
+            if (iy < 0 || iy >= H) { std::memset(seg, 0, KC * sizeof(float)); continue; }
+            const int64_t ix0 = ox * P.s - P.p;                       // leftmost input column
+            const int64_t kw0 = std::max<int64_t>(0, -ix0);           // first kw inside the image
+            const int64_t kw1 = std::min<int64_t>(K, W - ix0);        // one past the last
+            if (kw0 > 0) std::memset(seg, 0, kw0 * C * sizeof(float));
+            if (kw1 > kw0) std::memcpy(seg + kw0 * C, src + (iy * W + ix0 + kw0) * C, (kw1 - kw0) * C * sizeof(float));
+            if (kw1 < K) std::memset(seg + std::max(kw0, kw1) * C, 0, (K - std::max(kw0, kw1)) * C * sizeof(float));
+        }
+    }
+}
+
+// max pool on x [C, W, H] -> dst [C, OW, OH]; padding is ignored (-inf), like PyTorch MaxPool2d
+static void op_maxpool_nhwc(ggml_tensor * dst, int ith, int nth, void * ud) {
+    const auto & P = *(const nhwc_op_params *) ud;
+    const ggml_tensor * x = dst->src[0];
+    const int64_t C = x->ne[0], W = x->ne[1], H = x->ne[2];
+    const int64_t OW = dst->ne[1], OH = dst->ne[2];
+    const float * src = (const float *) x->data;
+    float       * out = (float *) dst->data;
+    int64_t i0, i1;
+    pixel_range(OW * OH, ith, nth, i0, i1);
+    for (int64_t i = i0; i < i1; i++) {
+        const int64_t ox = i % OW, oy = i / OW;
+        float * o = out + i * C;
+        for (int64_t c = 0; c < C; c++) o[c] = -INFINITY;
+        const int64_t y0 = std::max<int64_t>(0, oy * P.s - P.p), y1 = std::min<int64_t>(H, oy * P.s - P.p + P.k);
+        const int64_t x0 = std::max<int64_t>(0, ox * P.s - P.p), x1 = std::min<int64_t>(W, ox * P.s - P.p + P.k);
+        for (int64_t iy = y0; iy < y1; iy++)
+            for (int64_t ix = x0; ix < x1; ix++) {
+                const float * v = src + (iy * W + ix) * C;
+                for (int64_t c = 0; c < C; c++) o[c] = std::max(o[c], v[c]);   // vectorizes
+            }
+    }
+}
+
+static ggml_tensor * nhwc_custom(ggml_context * ctx, ggml_tensor * x, int64_t ne0, int64_t OW, int64_t OH,
+                                 ggml_custom_op_t fn, int k, int s, int p) {
+    if (!ggml_is_contiguous(x)) x = ggml_cont(ctx, x);
+    g_op_params.push_back({ k, s, p });
+    ggml_tensor * args[1] = { x };
+    return ggml_custom_4d(ctx, GGML_TYPE_F32, ne0, OW, OH, 1, args, 1, fn, GGML_N_TASKS_MAX, &g_op_params.back());
+}
+
+static ggml_tensor * maxpool_nhwc(ggml_context * ctx, ggml_tensor * x, int k, int s, int p) {
+    const int64_t OW = (x->ne[1] + 2 * p - k) / s + 1, OH = (x->ne[2] + 2 * p - k) / s + 1;
+    return nhwc_custom(ctx, x, x->ne[0], OW, OH, op_maxpool_nhwc, k, s, p);
+}
+
+// Convolution with channels-last activations x = [C, W, H, 1].
+//   w is [IC, OC] viewed from [1, 1, IC, OC] for 1x1, or [IC, KW, KH, OC] for KxK (reordered at load).
+// The patch matrix col = [KW*KH*C, OW, OH] has, for every output pixel, the KxK neighbourhood
+// laid out as (kh, kw, c) with c fastest. It is built by op_im2col_nhwc in one multithreaded
+// pass, one memcpy of K*C floats per (pixel, kh), with zero padding handled inline (no PAD copy).
+// The GEMM is mul_mat(weights, col), giving [OC, OW*OH]: channels-last again, no transpose.
+static ggml_tensor * conv2d_nhwc(ggml_context * ctx, ggml_tensor * x, ggml_tensor * w, ggml_tensor * b, int s, int p) {
+    const int64_t C = x->ne[0], W = x->ne[1], H = x->ne[2];
+    const bool    one = (w->ne[0] * w->ne[1] == 1) || (w->ne[1] == 1 && w->ne[2] == 1);   // 1x1 kernel
+    const int64_t K = one ? 1 : w->ne[1];
+    const int64_t OC = w->ne[3];
+    const int64_t OW = (W + 2 * p - K) / s + 1, OH = (H + 2 * p - K) / s + 1;
+    if (!ggml_is_contiguous(x)) x = ggml_cont(ctx, x);
+
+    ggml_tensor * col;
+    if (K == 1 && s == 1 && p == 0) {
+        col = ggml_reshape_2d(ctx, x, C, W * H);                       // the activation IS the matrix
+    } else {
+        col = nhwc_custom(ctx, x, K * K * C, OW, OH, op_im2col_nhwc, (int) K, s, p);   // [K*K*C, OW, OH]
+        col = ggml_reshape_2d(ctx, col, K * K * C, OW * OH);
+    }
+    ggml_tensor * w2 = ggml_reshape_2d(ctx, w, ggml_nelements(w) / OC, OC);   // [K*K*IC, OC]
+    ggml_tensor * y  = ggml_mul_mat(ctx, w2, col);                            // [OC, OW*OH]
+    y = ggml_reshape_4d(ctx, y, OC, OW, OH, 1);
+    return ggml_add(ctx, y, ggml_reshape_4d(ctx, b, OC, 1, 1, 1));
+}
+
 static ggml_tensor * conv2d(ggml_context * ctx, ggml_tensor * x, ggml_tensor * w, ggml_tensor * b, int s, int p) {
+    if (g_nhwc) return conv2d_nhwc(ctx, x, w, b, s, p);
     const ggml_type col_type = w->type == GGML_TYPE_F16 ? GGML_TYPE_F16 : GGML_TYPE_F32;
     ggml_tensor * col = ggml_im2col(ctx, w, x, s, s, p, p, 1, 1, true, col_type);   // [K, OW, OH, N]
     ggml_tensor * y = ggml_mul_mat(ctx,
@@ -322,35 +489,74 @@ static ggml_tensor * detect_decode(ggml_context * ctx, ggml_tensor * h, ggml_ten
     return ggml_reshape_2d(ctx, y, no, nx * ny * na);                   // .view(bs, -1, no)
 }
 
-static void build_graph(yolo_graph & G, const yolo_model & model, int size) {
+static std::string shape_str(const ggml_tensor * t) {
+    // printed PyTorch-style as [C, H, W] (ggml stores it as ne = [W, H, C, N])
+    return "[" + std::to_string(dim_c(t)) + ", " + std::to_string(dim_h(t)) + ", " + std::to_string(dim_w(t)) + "]";
+}
+
+// Check shapes before calling ggml, so a bad GGUF gives a readable error instead of a GGML_ASSERT abort.
+static void check_layer(size_t i, const yolo_layer & L, const std::vector<ggml_tensor *> & srcs) {
+    auto fail = [&](const std::string & why) {
+        std::string msg = "layer " + std::to_string(i) + " (\"" + L.desc + "\"): " + why + "\n  inputs:";
+        for (size_t j = 0; j < srcs.size(); j++)
+            msg += "\n    from " + std::to_string(L.from[j]) + (L.from[j] < 0 ? " (network input)" : "") +
+                   " -> " + shape_str(srcs[j]);
+        throw std::runtime_error(msg);
+    };
+    for (size_t j = 0; j < L.from.size(); j++) {
+        if (L.from[j] >= (int) i) fail("'from' refers to layer " + std::to_string(L.from[j]) + ", which comes later in the graph");
+        if (!srcs[j]) fail("'from' refers to a layer with no output (detect)");
+    }
+    // weight input channels: [KW, KH, IC, OC], or [IC, KW, KH, OC] for KxK weights in NHWC mode
+    const int64_t w_ic = L.w ? ((g_nhwc && L.k > 1) ? L.w->ne[0] : L.w->ne[2]) : 0;
+    if (L.type == layer_type::conv && w_ic != dim_c(srcs[0]))
+        fail("conv weight expects " + std::to_string(w_ic) + " input channels but its input has " +
+             std::to_string(dim_c(srcs[0])) + " (weight ne = [" + std::to_string(L.w->ne[0]) + ", " +
+             std::to_string(L.w->ne[1]) + ", " + std::to_string(L.w->ne[2]) + ", " + std::to_string(L.w->ne[3]) + "])");
+    if (L.type == layer_type::concat || L.type == layer_type::add)
+        for (size_t j = 1; j < srcs.size(); j++) {
+            if (dim_w(srcs[j]) != dim_w(srcs[0]) || dim_h(srcs[j]) != dim_h(srcs[0]))
+                fail("inputs have different spatial sizes");
+            if (L.type == layer_type::add && dim_c(srcs[j]) != dim_c(srcs[0]))
+                fail("add inputs have different channel counts");
+        }
+    if (L.type == layer_type::detect)
+        for (size_t j = 0; j < srcs.size(); j++)
+            if (L.det_w[j]->ne[2] != dim_c(srcs[j]))
+                fail("detect head " + std::to_string(j) + " expects " + std::to_string(L.det_w[j]->ne[2]) +
+                     " input channels but gets " + std::to_string(dim_c(srcs[j])));
+}
+
+static void build_graph(yolo_graph & G, const yolo_model & model, int width, int height, bool verbose) {
     ggml_init_params ip = {
-        ggml_tensor_overhead() * GGML_DEFAULT_GRAPH_SIZE + ggml_graph_overhead(), nullptr, /*no_alloc*/ true };
+        ggml_tensor_overhead() * GRAPH_SIZE + ggml_graph_overhead_custom(GRAPH_SIZE, false), nullptr, /*no_alloc*/ true };
     G.ctx = ggml_init(ip);
-    G.gf  = ggml_new_graph(G.ctx);
+    G.gf  = ggml_new_graph_custom(G.ctx, GRAPH_SIZE, false);
     ggml_context * ctx = G.ctx;
 
-    G.input = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, size, size, 3, 1);   // [W, H, C, N], planar RGB
+    std:: printf("\n\nwidth=%d height=%d\n\n", width, height); // waleed
+    G.input = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, width, height, 3, 1);   // [W, H, C, N], planar RGB
     ggml_set_name(G.input, "input");
     ggml_set_input(G.input);
+    // NHWC: the image comes in planar [W, H, 3]; move channels first once
+    ggml_tensor * net_in = g_nhwc ? ggml_cont(ctx, ggml_permute(ctx, G.input, 1, 2, 0, 3)) : G.input;
 
     std::vector<ggml_tensor *> out(model.layers.size(), nullptr);
-    auto in = [&](int idx) { return idx < 0 ? G.input : out[idx]; };
+    auto in = [&](int idx) { return idx < 0 ? net_in : out[idx]; };
 
     for (size_t i = 0; i < model.layers.size(); i++) {
         const yolo_layer & L = model.layers[i];
-        ggml_tensor * x = in(L.from[0]);
+        for (int f : L.from)
+            if (f < -1 || f >= (int) model.layers.size())
+                throw std::runtime_error("layer " + std::to_string(i) + " (\"" + L.desc + "\"): 'from' index " +
+                                         std::to_string(f) + " is out of range (-1 = input, 0.." +
+                                         std::to_string(model.layers.size() - 1) + ")");
+        std::vector<ggml_tensor *> srcs;
+        for (int f : L.from) srcs.push_back(in(f));
+        check_layer(i, L, srcs);
+        ggml_tensor * x = srcs[0];
         switch (L.type) {
             case layer_type::conv:
-                // if (x->ne[2] != L.w->ne[2]) // waleed
-                // {
-                //     std:: printf("x->ne[2]=%d L.w->ne[2]=%d layer=%lu k=%d s=%d p=%d from=[", x->ne[2], L.w->ne[2], i, L.k, L.s, L.p);
-
-                //     for (size_t j=0; j < L.from.size(); j++)
-                //     {
-                //         std::printf("%s%d", (j ? "," : ""), L.from[j]);
-                //     }
-                //     std::printf("]\n");
-                // }
                 x = apply_act(ctx, conv2d(ctx, x, L.w, L.b, L.s, L.p), L);
                 break;
             case layer_type::add:   // act(from[0] + from[1] + ...), all inputs the same shape
@@ -363,21 +569,25 @@ static void build_graph(yolo_graph & G, const yolo_model & model, int size) {
                 x = apply_act(ctx, x, L);
                 break;
             case layer_type::concat:
-                for (size_t j = 1; j < L.from.size(); j++) x = ggml_concat(ctx, x, in(L.from[j]), 2);
+                for (size_t j = 1; j < L.from.size(); j++) x = ggml_concat(ctx, x, in(L.from[j]), g_nhwc ? 0 : 2);
                 break;
             case layer_type::maxpool:
-                x = ggml_pool_2d(ctx, x, GGML_OP_POOL_MAX, L.k, L.k, L.s, L.s, (float) L.p, (float) L.p);
+                if (g_nhwc) {
+                    x = maxpool_nhwc(ctx, x, L.k, L.s, L.p);   // multithreaded, stays channels-last
+                } else {
+                    x = ggml_pool_2d(ctx, x, GGML_OP_POOL_MAX, L.k, L.k, L.s, L.s, (float) L.p, (float) L.p);
+                }
                 break;
             case layer_type::upsample:
-                x = ggml_upscale(ctx, x, L.scale, GGML_SCALE_MODE_NEAREST);
+                x = g_nhwc ? ggml_interpolate(ctx, x, x->ne[0], x->ne[1] * L.scale, x->ne[2] * L.scale, x->ne[3],
+                                              GGML_SCALE_MODE_NEAREST)
+                           : ggml_upscale(ctx, x, L.scale, GGML_SCALE_MODE_NEAREST);
                 break;
             case layer_type::detect: {
                 std::vector<ggml_tensor *> z;
                 for (size_t j = 0; j < L.from.size(); j++) {
-                    // {// waleed
-                    //     std:: printf("layer=%lu k=%d s=%d p=%d from=%d det", j, L.k, L.s, L.p, L.from[j]);
-                    // }
                     ggml_tensor * h = conv2d(ctx, in(L.from[j]), L.det_w[j], L.det_b[j], 1, 0);   // self.m[i](x[i])
+                    if (g_nhwc) h = ggml_cont(ctx, ggml_permute(ctx, h, 2, 0, 1, 3));            // back to [nx, ny, C]
                     ggml_set_name(h, ("head" + std::to_string(j)).c_str());
                     ggml_set_output(h);
                     ggml_build_forward_expand(G.gf, h);
@@ -414,6 +624,8 @@ static void build_graph(yolo_graph & G, const yolo_model & model, int size) {
             }
         }
         out[i] = x;
+        if (verbose)
+            std::printf("%4zu  %-48s -> %s\n", i, L.desc.c_str(), x ? shape_str(x).c_str() : "(heads)");
     }
 }
 
@@ -421,17 +633,24 @@ static void build_graph(yolo_graph & G, const yolo_model & model, int size) {
 // pre / post processing
 // ---------------------------------------------------------------------------
 
-struct letterbox_info { float ratio; int pad_x, pad_y; };
+struct letterbox_info { float ratio; int pad_x, pad_y; int out_w, out_h; };
 
-// Same geometry as yolov7's letterbox(auto=False): keep aspect ratio, pad with 114.
+// Same geometry as yolov7's letterbox(): keep aspect ratio, pad with 114.
+//   rect = false -> letterbox(auto=False): always size x size
+//   rect = true  -> letterbox(auto=True), what detect.py uses: pad only up to a multiple of
+//                   `stride`, so a 773x512 image becomes 640x448 instead of 640x640
 // Output is planar RGB float in [0,1], i.e. exactly the [W, H, 3] ggml layout.
-static letterbox_info letterbox(const uint8_t * img, int w, int h, int size, std::vector<float> & out) {
+static letterbox_info letterbox(const uint8_t * img, int w, int h, int size, int stride, bool rect,
+                                std::vector<float> & out) {
     const float r  = std::min((float) size / w, (float) size / h);
     const int   nw = (int) std::lround(w * r), nh = (int) std::lround(h * r);
-    const float dw = (size - nw) / 2.0f, dh = (size - nh) / 2.0f;
+    const int   pw = rect ? (size - nw) % stride : size - nw;
+    const int   ph = rect ? (size - nh) % stride : size - nh;
+    const int   out_w = nw + pw, out_h = nh + ph;
+    const float dw = pw / 2.0f, dh = ph / 2.0f;
     const int   left = (int) std::lround(dw - 0.1f), top = (int) std::lround(dh - 0.1f);
 
-    out.assign((size_t) 3 * size * size, 114.0f / 255.0f);
+    out.assign((size_t) 3 * out_w * out_h, 114.0f / 255.0f);
     const float sx = (float) w / nw, sy = (float) h / nh;
     for (int y = 0; y < nh; y++) {
         // bilinear, half-pixel centers (matches cv2.INTER_LINEAR for upscaling)
@@ -446,11 +665,11 @@ static letterbox_info letterbox(const uint8_t * img, int w, int h, int size, std
                 const float v00 = img[(y0 * w + x0) * 3 + c], v01 = img[(y0 * w + x1) * 3 + c];
                 const float v10 = img[(y1 * w + x0) * 3 + c], v11 = img[(y1 * w + x1) * 3 + c];
                 const float v = (v00 * (1 - ax) + v01 * ax) * (1 - ay) + (v10 * (1 - ax) + v11 * ax) * ay;
-                out[(size_t) c * size * size + (size_t) (y + top) * size + (x + left)] = v / 255.0f;
+                out[(size_t) c * out_w * out_h + (size_t) (y + top) * out_w + (x + left)] = v / 255.0f;
             }
         }
     }
-    return { r, left, top };
+    return { r, left, top, out_w, out_h };
 }
 
 struct detection { float x0, y0, x1, y1, score; int cls; };
@@ -555,6 +774,10 @@ struct params {
     int   size       = 0;      // 0 = model default (640)
     float conf_thres = 0.25f, iou_thres = 0.45f;
     bool  use_gpu    = false;
+    bool  verbose    = false;
+    bool  use_blas   = true;
+    bool  rect       = false;
+    bool  profile    = false;
     int   bench      = 0;
 };
 
@@ -567,8 +790,13 @@ static void usage(const char * argv0) {
         "  --conf F            confidence threshold (default 0.25)\n"
         "  --iou F             NMS IoU threshold (default 0.45)\n"
         "  --gpu               use the best available GPU backend (CUDA/Metal/Vulkan...)\n"
+        "  --no-blas           do not use the BLAS backend (Accelerate/OpenBLAS) even if built\n"
+        "  --rect              minimal padding like detect.py (e.g. 640x448 instead of 640x640)\n"
+        "  --nhwc              channels-last activations (no im2col for 1x1 convs, faster on CPU)\n"
+        "  --profile           time every op and print a per-op-type breakdown\n"
         "  --bench N           run N extra timed inferences\n"
-        "  --dump DIR          write input and raw head outputs as .bin (for verify.py)\n", argv0);
+        "  --dump DIR          write input and raw head outputs as .bin (for verify.py)\n"
+        "  -v, --verbose       print every layer and its output shape [C, H, W]\n", argv0);
 }
 
 static bool parse_args(int argc, char ** argv, params & p) {
@@ -583,6 +811,11 @@ static bool parse_args(int argc, char ** argv, params & p) {
         else if (a == "--conf")                 p.conf_thres = (float) std::atof(next());
         else if (a == "--iou")                  p.iou_thres  = (float) std::atof(next());
         else if (a == "--gpu")                  p.use_gpu    = true;
+        else if (a == "--no-blas")              p.use_blas   = false;
+        else if (a == "--rect")                 p.rect       = true;
+        else if (a == "--nhwc")                 g_nhwc       = true;
+        else if (a == "--profile")              p.profile    = true;
+        else if (a == "-v" || a == "--verbose") p.verbose    = true;
         else if (a == "--bench")                p.bench      = std::atoi(next());
         else if (a == "--dump")                 p.dump_dir   = next();
         else if (a == "-h" || a == "--help")    return false;
@@ -598,13 +831,40 @@ static void write_bin(const std::string & path, const float * data, size_t n) {
     std::fclose(f);
 }
 
+// --profile: the scheduler calls this before (ask=true) and after (ask=false) each node.
+// Answering "true" to every ask makes it compute one node at a time, so the time between two
+// "after" calls is that node's run time. That per-node sync adds some overhead, so the total
+// is a bit higher than a normal run, but the split between op types is representative.
+struct op_profile {
+    std::chrono::high_resolution_clock::time_point last;
+    std::vector<std::pair<std::string, double>> per_op;  // op name -> ms (insertion order)
+    std::vector<int> count;
+    double conv_mm_flops = 0;                             // 2*M*N*K summed over mul_mat nodes
+};
+
+static bool profile_cb(ggml_tensor * t, bool ask, void * user) {
+    if (ask) return true;
+    auto & P = *(op_profile *) user;
+    auto now = std::chrono::high_resolution_clock::now();
+    const double ms = std::chrono::duration<double, std::milli>(now - P.last).count();
+    P.last = now;
+    std::string name = ggml_op_desc(t);
+    if (t->op == GGML_OP_MUL_MAT)
+        P.conv_mm_flops += 2.0 * t->ne[0] * t->ne[1] * t->src[0]->ne[0];
+    for (size_t i = 0; i < P.per_op.size(); i++)
+        if (P.per_op[i].first == name) { P.per_op[i].second += ms; P.count[i]++; return true; }
+    P.per_op.push_back({ name, ms });
+    P.count.push_back(1);
+    return true;
+}
+
 int main(int argc, char ** argv) {
     params p;
     try {
         if (!parse_args(argc, argv, p)) { usage(argv[0]); return 1; }
 
         yolo_model model;
-        load_model(model, p.model.c_str(), p.use_gpu, p.n_threads);
+        load_model(model, p.model.c_str(), p.use_gpu, p.use_blas, p.n_threads);
         const int size = p.size > 0 ? p.size : model.input_size;
         const int max_stride = *std::max_element(model.strides.begin(), model.strides.end());
         if (size % max_stride != 0) throw std::runtime_error("input size must be a multiple of " + std::to_string(max_stride));
@@ -614,10 +874,10 @@ int main(int argc, char ** argv) {
         if (!img) throw std::runtime_error("failed to load image " + p.image);
 
         std::vector<float> input;
-        const letterbox_info lb = letterbox(img, w, h, size, input);
+        const letterbox_info lb = letterbox(img, w, h, size, max_stride, p.rect, input);
 
         yolo_graph G;
-        build_graph(G, model, size);
+        build_graph(G, model, lb.out_w, lb.out_h, p.verbose);
         if (!ggml_backend_sched_alloc_graph(model.sched, G.gf)) throw std::runtime_error("failed to allocate compute graph");
 
         auto run = [&]() {
@@ -630,7 +890,7 @@ int main(int argc, char ** argv) {
         auto t0 = std::chrono::high_resolution_clock::now();
         run();
         auto t1 = std::chrono::high_resolution_clock::now();
-        std::printf("inference (%dx%d, %d threads): %.1f ms\n", size, size, p.n_threads,
+        std::printf("inference (%dx%d, %d threads): %.1f ms\n", lb.out_w, lb.out_h, p.n_threads,
                     std::chrono::duration<double, std::milli>(t1 - t0).count());
 
         if (p.bench > 0) {
@@ -639,6 +899,28 @@ int main(int argc, char ** argv) {
             t1 = std::chrono::high_resolution_clock::now();
             std::printf("bench: %.1f ms / image over %d runs\n",
                         std::chrono::duration<double, std::milli>(t1 - t0).count() / p.bench, p.bench);
+        }
+
+        if (p.profile) {
+            op_profile P;
+            ggml_backend_sched_set_eval_callback(model.sched, profile_cb, &P);
+            P.last = std::chrono::high_resolution_clock::now();
+            run();
+            ggml_backend_sched_set_eval_callback(model.sched, nullptr, nullptr);
+            double total = 0;
+            for (auto & e : P.per_op) total += e.second;
+            std::vector<size_t> order(P.per_op.size());
+            for (size_t i = 0; i < order.size(); i++) order[i] = i;
+            std::sort(order.begin(), order.end(), [&](size_t a, size_t b) { return P.per_op[a].second > P.per_op[b].second; });
+            std::printf("\nper-op profile (one node at a time, %.1f ms total):\n", total);
+            for (size_t i : order)
+                std::printf("  %-14s %5d nodes  %9.1f ms  %5.1f%%\n", P.per_op[i].first.c_str(), P.count[i],
+                            P.per_op[i].second, 100.0 * P.per_op[i].second / total);
+            for (size_t i = 0; i < P.per_op.size(); i++)
+                if (P.per_op[i].first == "MUL_MAT")
+                    std::printf("  conv GEMMs: %.1f GFLOP -> %.1f GFLOP/s\n", P.conv_mm_flops / 1e9,
+                                P.conv_mm_flops / 1e6 / P.per_op[i].second);
+            std::printf("\n");
         }
 
         std::vector<std::vector<float>> heads(G.heads.size());
@@ -657,12 +939,12 @@ int main(int argc, char ** argv) {
 
         if (!p.dump_dir.empty()) {
             write_bin(p.dump_dir + "/input.bin", input.data(), input.size());
+            std::printf("dumped input of %dx%d (W x H)\n", lb.out_w, lb.out_h);
             for (size_t l = 0; l < heads.size(); l++)
                 write_bin(p.dump_dir + "/head" + std::to_string(l) + ".bin", heads[l].data(), heads[l].size());
             if (G.pred) write_bin(p.dump_dir + "/pred.bin", pred.data(), pred.size());
         }
 
-        // waleed
         std::vector<detection> dets = G.pred
             ? nms(filter_pred(pred, model.nc + 5, p.conf_thres), p.iou_thres)
             : nms(decode(model, heads, G.heads, p.conf_thres), p.iou_thres);

@@ -11,6 +11,10 @@ endif()
 #   -DGGML_DIR=/path/to/ggml   use a local ggml source checkout
 #   (default)                  fetch ggml from GitHub at a tested commit
 # GPU backends are the usual ggml options, e.g. -DGGML_CUDA=ON, -DGGML_METAL=ON, -DGGML_VULKAN=ON
+# Fast F32/F16 matrix-multiply kernels for the CPU backend (the conv GEMMs).
+# Standalone ggml leaves this OFF; llama.cpp turns it ON. ~1.6-2x faster here.
+set(GGML_LLAMAFILE ON CACHE BOOL "ggml: use llamafile sgemm kernels")
+
 set(GGML_DIR "" CACHE PATH "Path to a ggml source tree")
 set(GGML_GIT_TAG "facdc44a67da17df4433adcc468b424f48e9ded2" CACHE STRING "ggml commit to fetch when GGML_DIR is not set")
 

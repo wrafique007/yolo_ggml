@@ -7,7 +7,7 @@ Object detection with YOLOv7 using [ggml](https://github.com/ggml-org/ggml) as t
 | `convert_yolov7_to_gguf.py` | `.pt` checkpoint → `.gguf` (folds BN, fuses IDetect, stores topology as metadata) |
 | `yolov7.cpp` | ggml inference: load GGUF, letterbox, graph, decode, NMS, draw boxes |
 | `verify.py` | Compares ggml outputs to a numpy re-implementation of the PyTorch forward pass |
-| `inspect.py` | This checks input and output shpaes of layers and lets you know if there is any discrepancy |
+| `inspect.py` | This checks input and output shapes of layers and lets you know if there is any discrepancy |
 | `CMakeLists.txt` | Builds against a local ggml (`-DGGML_DIR=...`) or fetches it automatically |
 
 ## 1. Convert the weights
@@ -36,6 +36,11 @@ You don't need torch or the yolov7 repo; the checkpoint is read directly. Your o
 ```bash
 cmake -B build                       # fetches ggml automatically
 cmake -B build -DGGML_BACKTRACE_LLDB=ON
+cmake -B build -DGGML_LLAMAFILE=ON
+cmake -B build -DGGML_NATIVE=OFF -DGGML_CPU_ARM_ARCH=armv8.2-a+dotprod+fp16 -DGGML_LLAMAFILE=ON
+cmake -B build -DGGML_NATIVE=OFF -DGGML_CPU_ARM_ARCH=armv8.2-a+dotprod+fp16 -DGGML_BLAS=ON -DGGML_BLAS_VENDOR=Apple
+cmake -B build -DGGML_BLAS=ON -DGGML_BLAS_VENDOR=Apple -DGGML_ACCELERATE=ON 333 ms over 5 images, backends: BLAS + CPU
+cmake -B build -DGGML_ACCELERATE=ON 329 ms over 5 images, backends: BLAS + CPU
 # or: cmake -B build -DGGML_DIR=/path/to/ggml
 # GPU: add -DGGML_CUDA=ON / -DGGML_METAL=ON / -DGGML_VULKAN=ON
 cmake --build build -j
@@ -49,8 +54,14 @@ cmake --build build -j
 ./build/yolov7 -m yolov7-tiny-f32.gguf -i horses.jpg -s 416 -t 8   # smaller input, 8 threads
 
 ./build/yolov7 -m yolov7-f32.gguf -i horses.jpg -o out.jpg
+./build/yolov7 -m yolov7-f32.gguf -i horses.jpg -o out.jpg --gpu
 
 ./build/yolov7 -m yolov7x-f32.gguf -i horses.jpg -o out.jpg
+./build/yolov7 -m yolov7x-f32.gguf -i horses.jpg -o out.jpg --gpu
+
+./build/yolov7 -m yolov7x-f32.gguf -i horses.jpg --nhwc --rect -t 8 --bench 5
+./build/yolov7 -m yolov7x-f32.gguf -i horses.jpg --nhwc --rect -t 8 --bench 5 --profile
+./build/yolov7 -m yolov7x-f32.gguf -i horses.jpg --nhwc --rect -t 8 --bench 5 --no-blas
 ```
 
 Options: `--conf 0.25`, `--iou 0.45`, `--bench N`, `--dump DIR`.
@@ -66,6 +77,7 @@ python verify.py yolov7.pt dump
 
 ./build/yolov7 -m yolov7x-f32.gguf -i horses.jpg --dump dump
 python verify.py yolov7x.pt dump
+python inspect_gguf.py yolov7x-f32.gguf
 
 python inspect_gguf.py yolov7-f32.gguf
 python inspect_gguf.py yolov7x-f32.gguf
